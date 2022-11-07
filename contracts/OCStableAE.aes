@@ -1,0 +1,200 @@
+@compiler >= 6
+
+include "String.aes"
+include "Option.aes"
+include "./AEX9.aes"
+
+main contract OCStableAE =
+  record state = {
+    owner: address,
+    loans: loans_data_map,
+    loans_address: address_loan_map,
+    loan_applications: loan_applications_map,
+    liquidate_requests: liquidate_request_map,
+    next_loan_id: int,
+    oracle: o,
+    token: AEX9 }
+  
+  record loan_application = {
+    amount: int,
+    borrower: address,
+    ttl: int,
+    oquery: oq }
+
+  record loan_data = {
+    borrower: address,
+    ausd_amount: int,
+    ae_amount: int,
+    withdraw: bool }
+  
+  record loan_application_response = {
+    loan_id : int,
+    oquery: oq }
+  
+  record loan_data_resposne = {
+    loan_id: int,
+    borrower: address,
+    ausd_amount: int,
+    ae_amount: int,
+    withdraw: bool }
+
+  record loan_liquidation_request = {
+    oquery: oq,
+    requester: address,
+    ttl: int }
+
+  type o = oracle(string, string)
+  type oq = oracle_query(string, string)
+
+  // map(loan_id, loan_data)
+  type loans_data_map = map(int, loan_data)
+  // map(borrower_address, list(loan_id))
+  type address_loan_map = map(address, list(int))
+  // map(loan_id, loan_application)
+  type loan_applications_map = map(int, loan_application)
+  type liquidate_request_map = map(int, loan_liquidation_request)
+  
+  datatype event = LoanApplicationCreated(int, address, int) | LoanCreated(int, address, int) | TokenCreated(address) | LoanWithdrawn(int, address)
+
+  stateful entrypoint init(initial_supply: int, oracle_: o) : state =
+    // creates aex9 standarad AUSD token
+    let token_ = Chain.create("Ae USD", 0, "AUSD", Some(initial_supply)) : AEX9
+    token_.transfer(Call.caller , initial_supply)
+    Chain.event(TokenCreated(token_.address))
+    { owner = Call.caller, loans = {}, loans_address = {}, loan_applications = {}, liquidate_requests = {}, next_loan_id = 0, oracle = oracle_, token = token_ }
+  
+  // to submit loan application 
+  payable stateful entrypoint create_loan_application(amount: int) : loan_application_response =
+    require( amount > 0 , "AE must be greater then 0")
+    // submit oracle query for ae usd price
+    let oq_ : oq = query_ae_to_ausd(Int.to_str(amount))
+    let loan_id = state.next_loan_id
+    let ttl = Chain.block_height + 20
+    put(state{ loan_applications[loan_id] = { ttl = ttl, borrower = Call.caller, oquery = oq_, amount = amount }, next_loan_id = loan_id + 1 })
+    Chain.event(LoanApplicationCreated(loan_id, Call.caller, amount))
+    { loan_id = loan_id, oquery = oq_ }
+ 
+  // function to borrow AUSD on colletral of AE
+  payable stateful entrypoint borrow(loan_id: int) =
+    let loan_application_ : loan_application = 
+      switch(Map.lookup(loan_id , state.loan_applications))
+        None    => abort("Loan application not found!")
+        Some(n) => n
+    require(loan_application_.ttl>=Chain.block_height,"Loan application expire")
+    require(Call.caller==loan_application_.borrower,"Only loan application submitter can borrow")
+    require(Call.value>=loan_application_.amount, "Insufficient AE")
+    check_oracle_state()
+    // check query exsist on pricefeed oracle if exsist get answer
+    let ae_to_usd_str = 
+      switch(check_query(loan_application_.oquery))
+        None    => abort("Not able to get answer from query")
+        Some(n) => n
+    let ae_to_usd = 
+      switch(String.to_int(ae_to_usd_str))
+        None    => abort("Not able to convert to int")
+        Some(n) => n
+    // amount of ausd to mint after 30% interest cut
+    let ausd = (ae_to_usd*7)/10
+    require(ausd > 0, "Low AE amount to get more then 0 AUSD")
+    state.token.mint(Call.caller, ausd)
+    Chain.event(LoanCreated(loan_id, Call.caller, ausd))
+    put(state{ loans[loan_id] = { borrower = Call.caller, ae_amount = Call.value, ausd_amount = ausd, withdraw = false}, 
+      loans_address[Call.caller]  = List.insert_at(0, loan_id, Map.lookup_default(Call.caller, state.loans_address, [])),
+      loan_applications = Map.delete(loan_id, state.loan_applications) })
+
+  stateful entrypoint withdraw(loan_id: int) = 
+    let loan_ : loan_data = 
+      switch(Map.lookup(loan_id , state.loans))
+        None    => abort("Loan not found!")
+        Some(n) => n
+    require(Call.caller==loan_.borrower, "Loan borrower only can call")
+    require(!loan_.withdraw, "Loan already withdrawn")
+    // amount to return ausd
+    let ausd_return = ((loan_.ausd_amount *3)/7) + loan_.ausd_amount
+    require(Option.default(0, state.token.balance(Call.caller))>=ausd_return, "AUSD Insufficient")
+    require(Option.default(0, state.token.allowance_for_caller(Call.caller))>=ausd_return, "AUSD transfer allowance not given")
+    state.token.transfer_allowance(Call.caller, Contract.address, ausd_return)
+    state.token.burn(loan_.ausd_amount)
+    Chain.spend(Call.caller, loan_.ae_amount)
+    put(state{ loans[loan_id].withdraw = true })
+    Chain.event(LoanWithdrawn(loan_id, Call.caller))
+
+  payable stateful entrypoint raise_liqudation(loan_id: int) : oq = 
+    let loan_ : loan_data = 
+      switch(Map.lookup(loan_id , state.loans))
+        None    => abort("Loan not found!")
+        Some(n) => n    
+    require(!loan_.withdraw, "Loan already withdrawn")
+    switch(Map.lookup(loan_id , state.liquidate_requests))
+        None => require(true, "_")
+        Some(n) => require(n.ttl<Chain.block_height,"Liqudation already raised by someone")
+    let oq_ : oq = query_ae_to_ausd(Int.to_str(loan_.ae_amount))
+    let ttl = Chain.block_height + 20
+    put(state{ liquidate_requests[loan_id] = { requester = Call.caller, ttl = ttl, oquery = oq_ }})
+    oq_
+  
+  // resolve liquidate via trigger in case of default and reward caller
+  stateful entrypoint resolve_liquidation(loan_id :int) : bool =
+    let loan_ : loan_data = 
+      switch(Map.lookup(loan_id , state.loans))
+        None    => abort("Loan not found!")
+        Some(n) => n
+    require(!loan_.withdraw, "Loan already withdrawn")
+    let liquidate_request_ = 
+      switch(Map.lookup(loan_id , state.liquidate_requests))
+        None    => abort("Liqudate request not found!")
+        Some(n) => n
+    require(Call.caller==liquidate_request_.requester, "Only requester can call")
+    require(liquidate_request_.ttl>=Chain.block_height,"Liqudate request expire")
+    check_oracle_state()
+    let ae_to_usd_str = 
+      switch(check_query(liquidate_request_.oquery))
+        None    => abort("Not able to get answer from query")
+        Some(n) => n
+    let ae_to_usd = 
+      switch(String.to_int(ae_to_usd_str))
+        None    => abort("Not able to convert to int")
+        Some(n) => n
+    let total_ausd = (loan_.ausd_amount*10)/7
+    if(total_ausd>=ae_to_usd)
+      let diff = total_ausd-ae_to_usd
+      let dif_per = (diff*100)/total_ausd
+      if(diff>=10)
+        // reward caller for this trigger (need to implement in future)
+        put(state{ loans[loan_id].withdraw = true })
+        // use super hero dex to liquidate AE to ausd
+        // call swap_exact_ae_for_tokens of AedexV2Router (SuperHero Dex) 
+        true
+      else
+        false
+    else
+      false
+
+  entrypoint query_fee() =
+    Oracle.query_fee(state.oracle)
+
+  entrypoint check_query(query : oq) : option(string) =
+    Oracle.get_answer(state.oracle, query)
+  
+  entrypoint get_token_address() : address = 
+    state.token.address
+  
+  entrypoint get_loans_by_address(borrower: address) : list(loan_data_resposne) =
+    let loans = Map.lookup_default(borrower, state.loans_address, [])
+    List.map(loan_data_filter, loans)
+
+  entrypoint get_loan_by_id(loan_id) : option(loan_data) =
+    Map.lookup(loan_id, state.loans)
+
+  function loan_data_filter(loan_id: int) : loan_data_resposne =
+    let loan_ = Option.force(Map.lookup(loan_id, state.loans))
+    { loan_id = loan_id, borrower = loan_.borrower, ae_amount = loan_.ae_amount, ausd_amount = loan_.ausd_amount, withdraw = loan_.withdraw }
+  
+  function check_oracle_state() =
+    require(Oracle.check(state.oracle), "ORACLE_CHECK_FAILED")
+
+  stateful function query_ae_to_ausd(amount : string) : oq =
+    let fee = query_fee()
+    require(Call.value == fee, String.concat("AMOUNT_NOT_EQUAL_FEE_", Int.to_str(fee)))
+    check_oracle_state()
+    Oracle.query(state.oracle, amount, fee, RelativeTTL(20), RelativeTTL(20))
