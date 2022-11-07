@@ -58,7 +58,7 @@ describe('OCStableCoin', () => {
     assert.equal(balance, intial_supply)
   });
 
-  /*it('OCStableCoin: create_loan_application, borrow and withdraw', async () => {
+  it('OCStableCoin: create_loan_application, borrow and withdraw', async () => {
     console.log(`---------------------OCStableCoin: create_loan_application-------------`)
     let wallet_address = await utils.getDefaultAccounts()[2].address()
     let loan_application = (await contract.methods.create_loan_application( toAettos(1000), { onAccount: utils.getDefaultAccounts()[2], amount: 200000000000000 })).decodedResult;
@@ -77,7 +77,7 @@ describe('OCStableCoin', () => {
     await contract.methods.withdraw(loan_application.loan_id, { onAccount: utils.getDefaultAccounts()[2] })
     let balance1 = (await contract_aex9.methods.balance(wallet_address)).decodedResult;
     assert.isTrue(balance1 <= 1)
-  });*/
+  });
   
   it('OCStableCoin: liquidate loan', async () => {
     console.log(`---------------------OCStableCoin: liquidate_loan init------------------------------`)
